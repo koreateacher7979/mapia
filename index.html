@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>가치있는 미래교육 연구소 - 온라인 보이스 마피아</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, collection, onSnapshot, updateDoc, deleteDoc, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Configuration & Global Variables ---
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'mafia-voice-edu';
+        const apiKey = ""; // API Key provided at runtime
+
+        const PHASES = {
+            LOBBY: '대기실',
+            NIGHT: '밤',
+            DISCUSSION: '낮(토론)',
+            VOTING: '투표',
+            TRIAL: '최후변론',
+            GAME_OVER: '게임 종료'
+        };
+
+        const ROLES = {
+            MAFIA: '마피아',
+            POLICE: '경찰',
+            DOCTOR: '의사',
+            CITIZEN: '시민'
+        };
+
+        // --- State Management ---
+        let user = null;
+        let roomId = '';
+        let roomData = null;
+        let players = [];
+        let myData = null;
+        let isMuted = false;
+        let unsubRoom = null;
+        let unsubPlayers = null;
+        const lastPhaseRef = { current: '' };
+
+        // --- TTS Logic ---
+        const pcmToWav = (pcmData, sampleRate = 24000) => {
+            const buffer = new ArrayBuffer(44 + pcmData.length);
+            const view = new DataView(buffer);
+            const writeString = (offset, string) => {
+                for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
+            };
+            writeString(0, 'RIFF');
+            view.setUint32(4, 36 + pcmData.length, true);
+            writeString(8, 'WAVE');
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, 1, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeString(36, 'data');
+            view.setUint32(40, pcmData.length, true);
+            const pcmView = new Uint8Array(pcmData);
+            for (let i = 0; i < pcmData.length; i++) view.setUint8(44 + i, pcmView[i]);
+            return new Blob([view], { type: 'audio/wav' });
+        };
+
+        const speakText = async (text) => {
+            if (isMuted || !text) return;
+            try {
+                const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ parts: [{ text: `안정적이고 차분한 게임 사회자 목소리로 말해주세요: ${text}` }] }],
+                        generationConfig: {
+                            responseModalities: ["AUDIO"],
+                            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } }
+                        }
+                    })
+                });
+                const result = await response.json();
+                const base64Audio = result.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+                if (base64Audio) {
+                    const pcmData = Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0));
+                    const wavBlob = pcmToWav(pcmData, 24000);
+                    const audio = new Audio(URL.createObjectURL(wavBlob));
+                    audio.play();
+                }
+            } catch (err) { console.error("TTS Error:", err); }
+        };
+
+        // --- Core Functions ---
+        const updateUI = () => {
+            const root = document.getElementById('game-root');
+            if (!user) {
+                root.innerHTML = `<div class="flex items-center justify-center h-64 text-slate-400">시스템 연결 중...</div>`;
+                return;
+            }
+
+            if (!roomId || !roomData) {
+                renderLobby();
+            } else {
+                renderGame();
+            }
+            lucide.createIcons();
+        };
+
+        const renderLobby = () => {
+            const root = document.getElementById('game-root');
+            root.innerHTML = `
+                <div class="grid md:grid-cols-2 gap-8 animate-in fade-in duration-500">
+                    <!-- Create Room -->
+                    <div class="bg-slate-900 p-8 rounded-2xl border border-slate-800 shadow-xl">
+                        <div class="flex items-center gap-3 mb-4">
+                            <i data-lucide="play" class="text-emerald-500"></i>
+                            <h2 class="text-xl font-bold">새로운 방 만들기</h2>
+                        </div>
+                        <p class="text-slate-400 text-sm mb-6 leading-relaxed">방 코드를 직접 설정하고 닉네임을 입력하여 방장이 되어보세요.</p>
+                        
+                        <div class="space-y-4">
+                            <div>
+                                <label class="text-[10px] text-slate-500 font-bold ml-1 uppercase">게임 닉네임</label>
+                                <input type="text" id="create-nickname" placeholder="사용할 이름 입력" class="w-full bg-slate-950 border border-slate-800 p-4 rounded-xl focus:ring-2 focus:ring-emerald-500/50 outline-none transition-all">
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-slate-500 font-bold ml-1 uppercase">방 코드 설정</label>
+                                <input type="text" id="create-code" placeholder="예: MYROOM (공백 시 자동생성)" class="w-full bg-slate-950 border border-slate-800 p-4 rounded-xl font-mono uppercase focus:ring-2 focus:ring-emerald-500/50 outline-none transition-all">
+                            </div>
+                            <button id="btn-create" class="w-full py-4 bg-emerald-600 hover:bg-emerald-500 rounded-xl font-bold transition-all shadow-lg shadow-emerald-900/20">방 생성하기</button>
+                        </div>
+                    </div>
+
+                    <!-- Join Room -->
+                    <div class="bg-slate-900 p-8 rounded-2xl border border-slate-800 shadow-xl">
+                        <div class="flex items-center gap-3 mb-4">
+                            <i data-lucide="user-plus" class="text-blue-500"></i>
+                            <h2 class="text-xl font-bold">기존 방 참여</h2>
+                        </div>
+                        <p class="text-slate-400 text-sm mb-6 leading-relaxed">공유받은 방 코드를 입력하고 닉네임을 설정하여 입장하세요.</p>
+
+                        <div class="space-y-4">
+                            <div>
+                                <label class="text-[10px] text-slate-500 font-bold ml-1 uppercase">게임 닉네임</label>
+                                <input type="text" id="join-nickname" placeholder="사용할 이름 입력" class="w-full bg-slate-950 border border-slate-800 p-4 rounded-xl focus:ring-2 focus:ring-blue-500/50 outline-none transition-all">
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-slate-500 font-bold ml-1 uppercase">참여 코드 입력</label>
+                                <input type="text" id="join-code" placeholder="6자리 방 코드" class="w-full bg-slate-950 border border-slate-800 p-4 rounded-xl text-center font-mono tracking-widest text-lg uppercase focus:ring-2 focus:ring-blue-500/50 outline-none transition-all">
+                            </div>
+                            <button id="btn-join" class="w-full py-4 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold transition-all shadow-lg shadow-blue-900/20">참여하기</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.getElementById('btn-create').onclick = createRoom;
+            document.getElementById('btn-join').onclick = joinRoom;
+        };
+
+        const renderGame = () => {
+            const root = document.getElementById('game-root');
+            const phaseInfo = getPhaseInstructions();
+            
+            root.innerHTML = `
+                <div class="grid md:grid-cols-12 gap-6 animate-in zoom-in-95 duration-300">
+                    <!-- Left: Phase & Actions -->
+                    <div class="md:col-span-8 space-y-6">
+                        <!-- Tutorial/Instruction Box -->
+                        <div class="bg-indigo-950/40 border border-indigo-500/30 rounded-2xl p-6 shadow-inner">
+                            <div class="flex items-start gap-4">
+                                <div class="bg-indigo-500 p-2 rounded-lg"><i data-lucide="info" class="text-white w-5 h-5"></i></div>
+                                <div>
+                                    <h3 class="font-bold text-indigo-200 mb-1">${phaseInfo.title}</h3>
+                                    <p class="text-indigo-300/80 text-sm leading-relaxed">${phaseInfo.desc}</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Main Status Banner -->
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 flex justify-between items-center">
+                            <div class="flex items-center gap-4">
+                                <div class="${roomData.phase === PHASES.NIGHT ? 'text-indigo-400' : 'text-amber-400'}">
+                                    <i data-lucide="${roomData.phase === PHASES.NIGHT ? 'moon' : 'sun'}" class="w-8 h-8"></i>
+                                </div>
+                                <div>
+                                    <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">현재 단계</span>
+                                    <h4 class="text-xl font-black">${roomData.phase}</h4>
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-3">
+                                <div class="hidden md:flex flex-col items-end mr-4">
+                                    <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">방 코드</span>
+                                    <span class="font-mono text-emerald-400 font-bold">${roomId}</span>
+                                </div>
+                                ${roomData.phase === PHASES.LOBBY && myData?.isHost ? `
+                                    <button id="btn-start" class="px-6 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg font-bold">게임 시작</button>
+                                ` : ''}
+                            </div>
+                        </div>
+
+                        <!-- Action Panel -->
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden min-h-[300px]">
+                            <div class="p-4 bg-slate-800/50 border-b border-slate-700 flex justify-between items-center">
+                                <span class="text-xs font-bold text-slate-400">액션 패널</span>
+                                ${myData?.role ? `<span class="text-xs bg-indigo-500/20 text-indigo-400 px-2 py-1 rounded font-bold">${myData.role}</span>` : ''}
+                            </div>
+                            <div class="p-6" id="action-content">
+                                ${renderActionContent()}
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Right: Players & Logs -->
+                    <div class="md:col-span-4 space-y-6">
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+                            <div class="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-sm">참여자 명단 (${players.length})</div>
+                            <div class="p-2 space-y-1">
+                                ${players.map(p => `
+                                    <div class="flex items-center justify-between p-3 rounded-lg ${p.id === user.uid ? 'bg-slate-800 border border-slate-700' : ''}">
+                                        <div class="flex items-center gap-3">
+                                            <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ${!p.isAlive ? 'bg-red-900/20 text-red-500' : 'bg-slate-700 text-white'}">
+                                                ${p.name[0]}
+                                            </div>
+                                            <div class="flex flex-col">
+                                                <span class="text-sm font-semibold ${!p.isAlive ? 'text-slate-600 line-through' : ''}">${p.name} ${p.id === user.uid ? '(나)' : ''}</span>
+                                                ${!p.isAlive ? '<span class="text-[9px] text-red-700 font-bold uppercase">Dead</span>' : ''}
+                                            </div>
+                                        </div>
+                                        ${p.isHost ? '<i data-lucide="crown" class="w-4 h-4 text-amber-500"></i>' : ''}
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                        <button id="btn-exit" class="w-full flex items-center justify-center gap-2 p-3 text-xs text-slate-500 hover:text-red-400 transition-colors">
+                            <i data-lucide="log-out" class="w-4 h-4"></i> 방 나가기
+                        </button>
+                    </div>
+                </div>
+            `;
+
+            if (document.getElementById('btn-start')) document.getElementById('btn-start').onclick = startGame;
+            if (document.getElementById('btn-exit')) document.getElementById('btn-exit').onclick = exitRoom;
+            bindActionEvents();
+        };
+
+        const getPhaseInstructions = () => {
+            switch(roomData.phase) {
+                case PHASES.LOBBY: return { title: "대기실", desc: "플레이어들이 모두 입장할 때까지 기다려 주세요. 최소 4명이 모여야 게임을 시작할 수 있습니다. 닉네임과 방 코드를 친구들에게 공유하세요." };
+                case PHASES.NIGHT: return { title: "어둠이 내려앉은 밤", desc: "마피아는 희생자를 고르고, 경찰은 정체를 파악하며, 의사는 생명을 구합니다. 자신의 역할에 맞는 행동을 수행하세요." };
+                case PHASES.DISCUSSION: return { title: "낮의 토론 시간", desc: "밤 사이 일어난 사건을 확인하고, 누가 마피아인지 의심되는 사람을 자유롭게 추론하세요." };
+                case PHASES.VOTING: return { title: "최종 투표", desc: "가장 의심스러운 한 명을 지목하세요. 과반수 득표 시 재판대에 오르게 됩니다." };
+                case PHASES.TRIAL: return { title: "재판과 최후변론", desc: "지목된 자의 변론을 들으세요. 방장은 최종 유죄 여부를 판결할 책임이 있습니다." };
+                case PHASES.GAME_OVER: return { title: "게임 결과", desc: "모든 승패가 결정되었습니다. 수고하셨습니다!" };
+                default: return { title: "안내", desc: "사회자의 지시에 따라 게임을 진행하세요." };
+            }
+        };
+
+        const renderActionContent = () => {
+            if (!myData?.isAlive) return `<div class="text-center py-10 opacity-40"><i data-lucide="skull" class="w-12 h-12 mx-auto mb-4"></i><p>사망 상태입니다. 살아남은 자들의 사투를 지켜보세요.</p></div>`;
+
+            if (roomData.phase === PHASES.NIGHT) {
+                if (myData.role === ROLES.CITIZEN) return `<p class="text-center py-10 italic text-indigo-400">당신은 시민입니다. 조용히 아침이 밝기를 기다리십시오...</p>`;
+                return `
+                    <p class="text-sm text-slate-400 mb-4">${myData.role} 전용 행동: 대상을 선택하세요.</p>
+                    <div class="grid grid-cols-2 gap-3">
+                        ${players.filter(p => p.isAlive && p.id !== user.uid).map(p => `
+                            <button class="action-target py-3 rounded-lg border border-slate-700 bg-slate-800 hover:border-indigo-500 transition-all ${myData.target === p.id ? 'border-indigo-500 bg-indigo-500/10' : ''}" data-id="${p.id}">
+                                ${p.name}
+                            </button>
+                        `).join('')}
+                    </div>
+                `;
+            }
+
+            if (roomData.phase === PHASES.DISCUSSION || roomData.phase === PHASES.VOTING) {
+                return `
+                    <p class="text-sm text-slate-400 mb-4">누가 마피아입니까? 의심스러운 사람에게 투표하세요.</p>
+                    <div class="grid grid-cols-2 gap-3">
+                        ${players.filter(p => p.isAlive).map(p => `
+                            <button class="vote-target py-3 rounded-lg border border-slate-700 bg-slate-800 hover:border-amber-500 transition-all ${myData.vote === p.id ? 'border-amber-500 bg-amber-500/10' : ''}" data-id="${p.id}">
+                                ${p.name} ${p.id === user.uid ? '(나)' : ''}
+                            </button>
+                        `).join('')}
+                    </div>
+                `;
+            }
+
+            if (roomData.phase === PHASES.TRIAL) {
+                const nominee = players.find(p => p.id === roomData.nomineeId);
+                return `
+                    <div class="text-center py-6">
+                        <div class="w-16 h-16 bg-red-500/20 rounded-full flex items-center justify-center mx-auto mb-4 border border-red-500/50">
+                            <i data-lucide="mic" class="text-red-500 animate-pulse"></i>
+                        </div>
+                        <h5 class="text-lg font-bold mb-2">${nominee?.name} 님의 최후 변론</h5>
+                        <p class="text-sm text-slate-400 mb-6">마이크 권한이 활성화되었습니다.</p>
+                        ${myData.isHost ? `
+                            <div class="flex gap-4">
+                                <button id="btn-guilty" class="flex-1 py-3 bg-red-600 rounded-xl font-bold shadow-lg shadow-red-900/20">유죄 (처형)</button>
+                                <button id="btn-innocent" class="flex-1 bg-slate-700 rounded-xl font-bold">무죄 (방면)</button>
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+            }
+
+            if (roomData.phase === PHASES.GAME_OVER) {
+                return `<div class="text-center py-10"><h2 class="text-2xl font-black text-emerald-400 mb-2">게임 종료</h2><p class="text-slate-400">${roomData.lastPhaseMsg}</p></div>`;
+            }
+
+            return `<div class="text-center py-10 text-slate-600 italic">다른 플레이어들의 결정을 기다리는 중입니다...</div>`;
+        };
+
+        const bindActionEvents = () => {
+            document.querySelectorAll('.action-target').forEach(btn => {
+                btn.onclick = async () => {
+                    const tid = btn.dataset.id;
+                    const pRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId, 'players', user.uid);
+                    await updateDoc(pRef, { target: tid });
+                    
+                    const actives = players.filter(p => p.isAlive && p.role !== ROLES.CITIZEN);
+                    const updatedCount = players.filter(p => p.isAlive && p.role !== ROLES.CITIZEN && (p.id === user.uid ? tid : p.target)).length;
+                    if (updatedCount >= actives.length && myData.isHost) {
+                        processNight();
+                    }
+                };
+            });
+
+            document.querySelectorAll('.vote-target').forEach(btn => {
+                btn.onclick = async () => {
+                    const vid = btn.dataset.id;
+                    const pRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId, 'players', user.uid);
+                    await updateDoc(pRef, { vote: vid });
+                };
+            });
+
+            if (document.getElementById('btn-guilty')) {
+                document.getElementById('btn-guilty').onclick = () => handleExecution(true);
+                document.getElementById('btn-innocent').onclick = () => handleExecution(false);
+            }
+        };
+
+        // --- Logic Handlers ---
+        const createRoom = async () => {
+            if (!user) return;
+            const nickname = document.getElementById('create-nickname').value.trim();
+            let customId = document.getElementById('create-code').value.trim().toUpperCase();
+            
+            if (!nickname) { alert("닉네임을 입력해주세요."); return; }
+            if (!customId) customId = Math.random().toString(36).substring(2, 8).toUpperCase();
+
+            const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', customId);
+            const checkSnap = await getDoc(roomRef);
+            if (checkSnap.exists()) { alert("이미 사용 중인 방 코드입니다. 다른 코드를 사용해주세요."); return; }
+
+            await setDoc(roomRef, {
+                id: customId, host: user.uid, status: PHASES.LOBBY, phase: PHASES.LOBBY, createdAt: Date.now(),
+                lastPhaseMsg: "새로운 게임방이 생성되었습니다. 모두 환영합니다!"
+            });
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', customId, 'players', user.uid), {
+                name: nickname, isHost: true, isAlive: true, role: null, vote: null, target: null
+            });
+            startListening(customId);
+        };
+
+        const joinRoom = async () => {
+            if (!user) return;
+            const nickname = document.getElementById('join-nickname').value.trim();
+            const id = document.getElementById('join-code').value.trim().toUpperCase();
+            
+            if (!nickname) { alert("닉네임을 입력해주세요."); return; }
+            if (!id) { alert("방 코드를 입력해주세요."); return; }
+
+            const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', id);
+            const snap = await getDoc(roomRef);
+            if (!snap.exists()) { alert("방을 찾을 수 없습니다. 코드를 확인해주세요."); return; }
+
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', id, 'players', user.uid), {
+                name: nickname, isHost: false, isAlive: true, role: null, vote: null, target: null
+            });
+            startListening(id);
+        };
+
+        const startListening = (id) => {
+            if (unsubRoom) unsubRoom();
+            if (unsubPlayers) unsubPlayers();
+
+            roomId = id;
+            const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', id);
+            unsubRoom = onSnapshot(roomRef, (snapshot) => {
+                if (snapshot.exists()) {
+                    roomData = snapshot.data();
+                    if (roomData.lastPhaseMsg && lastPhaseRef.current !== roomData.lastPhaseMsg) {
+                        lastPhaseRef.current = roomData.lastPhaseMsg;
+                        speakText(roomData.lastPhaseMsg);
+                    }
+                    updateUI();
+                } else {
+                    exitRoom();
+                }
+            }, (err) => console.error("Permission error or room closed:", err));
+
+            const playersCol = collection(db, 'artifacts', appId, 'public', 'data', 'rooms', id, 'players');
+            unsubPlayers = onSnapshot(playersCol, (snapshot) => {
+                players = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                myData = players.find(p => p.id === user.uid);
+                updateUI();
+            }, (err) => console.error("Permission error on players:", err));
+        };
+
+        const startGame = async () => {
+            if (players.length < 4) { alert("최소 4명이 필요합니다."); return; }
+            const shuffled = [...players].sort(() => Math.random() - 0.5);
+            const roles = [ROLES.MAFIA, ROLES.POLICE, ROLES.DOCTOR];
+            for (let i = 3; i < players.length; i++) roles.push(ROLES.CITIZEN);
+            
+            for (let i = 0; i < shuffled.length; i++) {
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId, 'players', shuffled[i].id), {
+                    role: roles[i], isAlive: true, target: null, vote: null
+                });
+            }
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId), {
+                phase: PHASES.NIGHT, lastPhaseMsg: "게임이 시작되었습니다. 밤이 되었습니다. 모두 눈을 감아주세요."
+            });
+        };
+
+        const processNight = async () => {
+            const mafiaAction = players.find(p => p.role === ROLES.MAFIA && p.isAlive)?.target;
+            const doctorAction = players.find(p => p.role === ROLES.DOCTOR && p.isAlive)?.target;
+            let deadId = null;
+            let msg = "☀️ 아침이 밝았습니다. ";
+
+            if (mafiaAction && mafiaAction !== doctorAction) {
+                deadId = mafiaAction;
+                const victim = players.find(p => p.id === deadId);
+                msg += `지난밤, ${victim.name} 님이 마피아의 습격을 받아 사망했습니다.`;
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId, 'players', deadId), { isAlive: false });
+            } else if (mafiaAction && mafiaAction === doctorAction) {
+                msg += "기적적으로 의사가 희생자를 살려냈습니다!";
+            } else {
+                msg += "아무런 사건도 일어나지 않은 평화로운 밤이었습니다.";
+            }
+
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId), {
+                phase: PHASES.DISCUSSION, lastPhaseMsg: msg
+            });
+            checkWin();
+        };
+
+        const handleExecution = async (guilty) => {
+            const nominee = players.find(p => p.id === roomData.nomineeId);
+            let msg = guilty ? `${nominee.name} 님이 처형되었습니다.` : `${nominee.name} 님이 혐의를 벗고 방면되었습니다.`;
+            if (guilty) await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId, 'players', nominee.id), { isAlive: false });
+            
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId), {
+                phase: PHASES.NIGHT, lastPhaseMsg: msg + " 다시 밤이 찾아옵니다."
+            });
+            checkWin();
+        };
+
+        const checkWin = () => {
+            const mafias = players.filter(p => p.isAlive && p.role === ROLES.MAFIA).length;
+            const citizens = players.filter(p => p.isAlive && p.role !== ROLES.MAFIA).length;
+            if (mafias === 0) endGame("축하합니다! 모든 마피아를 검거하여 시민이 승리했습니다.");
+            else if (mafias >= citizens) endGame("마피아가 마을을 완전히 장악했습니다. 마피아의 완승입니다.");
+        };
+
+        const endGame = async (msg) => {
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId), {
+                phase: PHASES.GAME_OVER, status: PHASES.GAME_OVER, lastPhaseMsg: msg
+            });
+        };
+
+        const exitRoom = () => { 
+            if (unsubRoom) unsubRoom();
+            if (unsubPlayers) unsubPlayers();
+            roomId = ''; roomData = null; updateUI(); 
+        };
+
+        // --- Init ---
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else { 
+                    await signInAnonymously(auth); 
+                }
+            } catch (err) { console.error("Auth Error:", err); }
+        };
+
+        window.onload = () => {
+            initAuth();
+            onAuthStateChanged(auth, (u) => { 
+                user = u; 
+                updateUI(); 
+            });
+        };
+
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;700;900&display=swap');
+        body { font-family: 'Pretendard', sans-serif; background-color: #020617; color: #f8fafc; overflow-x: hidden; }
+        .animate-in { animation: fadeIn 0.5s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+
+    <div class="max-w-4xl mx-auto">
+        <!-- Developer Header -->
+        <div class="mb-10 text-center space-y-2">
+            <div class="inline-block px-4 py-1 bg-gradient-to-r from-red-600 to-amber-600 rounded-full text-[10px] font-black tracking-[0.2em] mb-2 shadow-lg shadow-red-900/20">
+                OFFICIAL SYSTEM
+            </div>
+            <h1 class="text-3xl md:text-4xl font-black tracking-tighter bg-clip-text text-transparent bg-gradient-to-b from-white to-slate-500">
+                VOICE MAFIA
+            </h1>
+            <div class="bg-indigo-600/10 border border-indigo-500/20 py-2 px-4 rounded-lg inline-block mt-4">
+                <p class="text-indigo-400 font-bold text-sm">개발자: 가치있는 미래교육 연구소 대표 김병찬</p>
+            </div>
+        </div>
+
+        <!-- Main Game Root -->
+        <div id="game-root">
+            <div class="flex items-center justify-center h-64 text-slate-500 italic">서버 접속 중...</div>
+        </div>
+
+        <!-- Instructions Footer -->
+        <div class="mt-12 grid grid-cols-1 md:grid-cols-3 gap-4 border-t border-slate-900 pt-8 opacity-50 text-[10px] uppercase tracking-widest text-slate-500">
+            <div class="flex items-center gap-2">
+                <div class="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+                Custom Room Code
+            </div>
+            <div class="flex items-center gap-2">
+                <div class="w-1.5 h-1.5 rounded-full bg-blue-500"></div>
+                Set Nickname
+            </div>
+            <div class="flex items-center gap-2">
+                <div class="w-1.5 h-1.5 rounded-full bg-indigo-500"></div>
+                Voice Guidance
+            </div>
+        </div>
+        
+        <p class="mt-8 text-center text-slate-700 text-[10px] font-medium uppercase tracking-[0.3em]">
+            &copy; 2024 Valuable Future Education Research Institute
+        </p>
+    </div>
+
+</body>
+</html>
