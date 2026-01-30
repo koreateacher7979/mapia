@@ -3,52 +3,20 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>가치있는 미래교육 연구소 - 온라인 보이스 마피아</title>
+    <title>가치있는 미래교육 연구소 - 보이스 마피아</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
-    <!-- Firebase SDKs -->
-    <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, setDoc, getDoc, collection, onSnapshot, updateDoc, deleteDoc, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-
-        // --- Configuration & Global Variables ---
-        // 외부 배포 시 아래 YOUR_CONFIG_HERE 부분에 본인의 Firebase 콘솔 설정값을 붙여넣으세요.
-        let firebaseConfig;
-        try {
-            firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
-                apiKey: "YOUR_API_KEY",
-                authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
-                projectId: "YOUR_PROJECT_ID",
-                storageBucket: "YOUR_PROJECT_ID.appspot.com",
-                messagingSenderId: "YOUR_SENDER_ID",
-                appId: "YOUR_APP_ID"
-            };
-        } catch (e) {
-            console.error("Firebase Config Error:", e);
-        }
-
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'mafia-voice-edu-external';
-        const apiKey = ""; // TTS용 API Key (Canvas 환경에서 자동 제공)
-
-        // Firebase 초기화 시도
-        let app, auth, db;
-        try {
-            if (firebaseConfig && firebaseConfig.apiKey !== "YOUR_API_KEY") {
-                app = initializeApp(firebaseConfig);
-                auth = getAuth(app);
-                db = getFirestore(app);
-            }
-        } catch (e) {
-            console.error("Firebase Init Failed:", e);
-        }
+    <script>
+        // --- 설정 및 전역 변수 ---
+        const apiKey = ""; 
 
         const PHASES = {
             LOBBY: '대기실',
             NIGHT: '밤',
-            DISCUSSION: '낮(토론)',
-            VOTING: '투표',
-            TRIAL: '최후변론',
+            MORNING: '사건 브리핑',
+            DISCUSSION: '자유 토론',
+            VOTING: '투표 진행',
+            TRIAL: '최후 변론',
             GAME_OVER: '게임 종료'
         };
 
@@ -59,18 +27,22 @@
             CITIZEN: '시민'
         };
 
-        // --- State Management ---
-        let user = null;
-        let roomId = '';
-        let roomData = null;
+        // --- 상태 관리 ---
         let players = [];
-        let myData = null;
+        let phase = PHASES.LOBBY;
+        let logs = [];
+        let myId = 0;
         let isMuted = false;
-        let unsubRoom = null;
-        let unsubPlayers = null;
-        const lastPhaseRef = { current: '' };
+        let nomineeId = null;
+        let currentSubtitles = ""; 
+        let chatInputBuffer = ""; 
+        
+        let speechQueue = [];
+        let isProcessingQueue = false;
 
-        // --- TTS Logic ---
+        const AI_NAMES = ["강호동", "유재석", "신동엽", "이경규", "김구라", "박명수", "하하"];
+
+        // --- TTS 및 동기화 로직 ---
         const pcmToWav = (pcmData, sampleRate = 24000) => {
             const buffer = new ArrayBuffer(44 + pcmData.length);
             const view = new DataView(buffer);
@@ -95,516 +67,516 @@
             return new Blob([view], { type: 'audio/wav' });
         };
 
-        const speakText = async (text) => {
-            if (isMuted || !text || !apiKey) return;
+        const processQueue = async () => {
+            if (isProcessingQueue || speechQueue.length === 0) return;
+            isProcessingQueue = true;
+
+            const { text, isChat, speakerName, speakerId, callback } = speechQueue.shift();
+            
             try {
+                const promptPrefix = isChat ? "한국어로 연극 대사처럼 감정을 담아 아주 자연스럽게 말해주세요: " : "마피아 게임 사회자로서 신뢰감 있게 한국어로 말해주세요: ";
                 const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        contents: [{ parts: [{ text: `안정적이고 차분한 게임 사회자 목소리로 말해주세요: ${text}` }] }],
+                        contents: [{ parts: [{ text: promptPrefix + text }] }],
                         generationConfig: {
                             responseModalities: ["AUDIO"],
                             speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } }
                         }
                     })
                 });
-                const result = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP Error: ${response.status}`);
+                }
+
+                const responseText = await response.text();
+                if (!responseText) throw new Error("Empty response body");
+                
+                const result = JSON.parse(responseText);
                 const base64Audio = result.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+                
                 if (base64Audio) {
                     const pcmData = Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0));
                     const wavBlob = pcmToWav(pcmData, 24000);
                     const audio = new Audio(URL.createObjectURL(wavBlob));
-                    audio.play();
+                    
+                    await new Promise(resolve => {
+                        audio.oncanplaythrough = resolve;
+                        audio.onerror = resolve;
+                    });
+
+                    // [동기화] 음성이 재생될 때만 텍스트와 로그를 업데이트하여 중복 방지
+                    const displayMsg = speakerName ? `${speakerName}: "${text}"` : text;
+                    currentSubtitles = displayMsg;
+                    logs.push(displayMsg);
+                    if (logs.length > 50) logs.shift();
+
+                    if (speakerId !== undefined && players[speakerId]) {
+                        players[speakerId].isSpeaking = true;
+                    }
+                    
+                    if (callback) callback();
+                    updateUI();
+
+                    await new Promise((resolve) => {
+                        audio.onended = resolve;
+                        audio.onerror = resolve; 
+                        audio.play().catch(resolve);
+                    });
+                } else {
+                    throw new Error("No audio data in response");
                 }
-            } catch (err) { console.error("TTS Error:", err); }
+            } catch (err) { 
+                console.error("TTS 에러 처리:", err);
+                // 음성 재생 실패 시에도 텍스트는 보여주고 다음으로 진행
+                const displayMsg = speakerName ? `${speakerName}: "${text}" (음성 오류)` : text;
+                logs.push(displayMsg);
+                if (callback) callback();
+                updateUI();
+                await new Promise(r => setTimeout(r, 2000));
+            } finally {
+                currentSubtitles = "";
+                if (speakerId !== undefined && players[speakerId]) {
+                    players[speakerId].isSpeaking = false;
+                }
+                updateUI();
+                isProcessingQueue = false;
+                setTimeout(processQueue, 300);
+            }
         };
 
-        // --- Core Functions ---
+        const speakText = (text, isChat = false, speakerName = "", speakerId = undefined, callback = null) => {
+            if (isMuted || !text) return;
+            // 중복 멘트 요청 방지
+            if (speechQueue.some(q => q.text === text)) return;
+            speechQueue.push({ text, isChat, speakerName, speakerId, callback });
+            processQueue();
+        };
+
+        // --- UI Rendering ---
         const updateUI = () => {
             const root = document.getElementById('game-root');
+            const activeElId = document.activeElement ? document.activeElement.id : null;
+            const selectionStart = document.activeElement ? document.activeElement.selectionStart : null;
+
+            if (phase === PHASES.LOBBY) renderLobby();
+            else renderGame();
             
-            // Firebase 설정 오류 핸들링
-            if (!app) {
-                root.innerHTML = `
-                    <div class="bg-red-900/20 border border-red-500/50 p-8 rounded-2xl text-center max-w-md mx-auto">
-                        <i data-lucide="alert-circle" class="w-12 h-12 text-red-500 mx-auto mb-4"></i>
-                        <h2 class="text-xl font-bold text-red-200 mb-2">설정 오류</h2>
-                        <p class="text-sm text-red-300/80 leading-relaxed">
-                            Firebase 설정값이 유효하지 않습니다. <br>
-                            외부 배포 시 <b>firebaseConfig</b> 변수를 본인의 프로젝트 값으로 수정해야 합니다.
-                        </p>
-                    </div>
-                `;
-                lucide.createIcons();
-                return;
-            }
-
-            if (!user) {
-                root.innerHTML = `
-                    <div class="flex flex-col items-center justify-center h-64 space-y-4">
-                        <div class="w-10 h-10 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
-                        <div class="text-slate-400 font-medium">서버 접속 중...</div>
-                    </div>
-                `;
-                return;
-            }
-
-            if (!roomId || !roomData) {
-                renderLobby();
-            } else {
-                renderGame();
-            }
             lucide.createIcons();
+
+            if (activeElId) {
+                const el = document.getElementById(activeElId);
+                if (el) {
+                    el.focus();
+                    if (selectionStart !== null) el.setSelectionRange(selectionStart, selectionStart);
+                }
+            }
         };
 
         const renderLobby = () => {
             const root = document.getElementById('game-root');
             root.innerHTML = `
-                <div class="grid md:grid-cols-2 gap-8 animate-in fade-in duration-500">
-                    <!-- Create Room -->
-                    <div class="bg-slate-900 p-8 rounded-2xl border border-slate-800 shadow-xl">
-                        <div class="flex items-center gap-3 mb-4">
-                            <i data-lucide="play" class="text-emerald-500"></i>
-                            <h2 class="text-xl font-bold">새로운 방 만들기</h2>
+                <div class="max-w-md mx-auto bg-slate-900 p-8 rounded-[40px] border border-slate-800 shadow-2xl animate-in fade-in duration-500">
+                    <div class="flex flex-col items-center gap-4 mb-8">
+                        <div class="p-5 bg-red-600/20 rounded-full border border-red-600/30">
+                            <i data-lucide="mic" class="text-red-500 w-10 h-10"></i>
                         </div>
-                        <p class="text-slate-400 text-sm mb-6 leading-relaxed">방 코드를 직접 설정하고 닉네임을 입력하여 방장이 되어보세요.</p>
-                        
-                        <div class="space-y-4">
-                            <div>
-                                <label class="text-[10px] text-slate-500 font-bold ml-1 uppercase">게임 닉네임</label>
-                                <input type="text" id="create-nickname" placeholder="사용할 이름 입력" class="w-full bg-slate-950 border border-slate-800 p-4 rounded-xl focus:ring-2 focus:ring-emerald-500/50 outline-none transition-all">
-                            </div>
-                            <div>
-                                <label class="text-[10px] text-slate-500 font-bold ml-1 uppercase">방 코드 설정</label>
-                                <input type="text" id="create-code" placeholder="예: MYROOM (공백 시 자동생성)" class="w-full bg-slate-950 border border-slate-800 p-4 rounded-xl font-mono uppercase focus:ring-2 focus:ring-emerald-500/50 outline-none transition-all">
-                            </div>
-                            <button id="btn-create" class="w-full py-4 bg-emerald-600 hover:bg-emerald-500 rounded-xl font-bold transition-all shadow-lg shadow-emerald-900/20">방 생성하기</button>
-                        </div>
+                        <h2 class="text-3xl font-black tracking-tighter">VOICE MAFIA</h2>
                     </div>
-
-                    <!-- Join Room -->
-                    <div class="bg-slate-900 p-8 rounded-2xl border border-slate-800 shadow-xl">
-                        <div class="flex items-center gap-3 mb-4">
-                            <i data-lucide="user-plus" class="text-blue-500"></i>
-                            <h2 class="text-xl font-bold">기존 방 참여</h2>
+                    <div class="space-y-6">
+                        <div>
+                            <label class="text-[10px] text-slate-500 font-bold ml-1 uppercase tracking-widest">당신의 닉네임</label>
+                            <input type="text" id="player-nickname" placeholder="이름을 입력하세요" class="w-full bg-slate-950 border border-slate-800 p-5 rounded-3xl focus:ring-2 focus:ring-red-500/50 outline-none transition-all text-center font-bold text-white">
                         </div>
-                        <p class="text-slate-400 text-sm mb-6 leading-relaxed">공유받은 방 코드를 입력하고 닉네임을 설정하여 입장하세요.</p>
-
-                        <div class="space-y-4">
-                            <div>
-                                <label class="text-[10px] text-slate-500 font-bold ml-1 uppercase">게임 닉네임</label>
-                                <input type="text" id="join-nickname" placeholder="사용할 이름 입력" class="w-full bg-slate-950 border border-slate-800 p-4 rounded-xl focus:ring-2 focus:ring-blue-500/50 outline-none transition-all">
-                            </div>
-                            <div>
-                                <label class="text-[10px] text-slate-500 font-bold ml-1 uppercase">참여 코드 입력</label>
-                                <input type="text" id="join-code" placeholder="6자리 방 코드" class="w-full bg-slate-950 border border-slate-800 p-4 rounded-xl text-center font-mono tracking-widest text-lg uppercase focus:ring-2 focus:ring-blue-500/50 outline-none transition-all">
-                            </div>
-                            <button id="btn-join" class="w-full py-4 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold transition-all shadow-lg shadow-blue-900/20">참여하기</button>
-                        </div>
+                        <button onclick="startGame()" class="w-full py-5 bg-red-600 hover:bg-red-500 rounded-3xl font-black transition-all shadow-lg shadow-red-900/30 text-lg">
+                            게임 시작하기
+                        </button>
                     </div>
                 </div>
             `;
-            document.getElementById('btn-create').onclick = createRoom;
-            document.getElementById('btn-join').onclick = joinRoom;
         };
 
         const renderGame = () => {
             const root = document.getElementById('game-root');
-            const phaseInfo = getPhaseInstructions();
+            const me = players[myId];
             
             root.innerHTML = `
                 <div class="grid md:grid-cols-12 gap-6 animate-in zoom-in-95 duration-300">
-                    <!-- Left: Phase & Actions -->
                     <div class="md:col-span-8 space-y-6">
-                        <!-- Tutorial/Instruction Box -->
-                        <div class="bg-indigo-950/40 border border-indigo-500/30 rounded-2xl p-6 shadow-inner">
-                            <div class="flex items-start gap-4">
-                                <div class="bg-indigo-500 p-2 rounded-lg"><i data-lucide="info" class="text-white w-5 h-5"></i></div>
-                                <div>
-                                    <h3 class="font-bold text-indigo-200 mb-1">${phaseInfo.title}</h3>
-                                    <p class="text-indigo-300/80 text-sm leading-relaxed">${phaseInfo.desc}</p>
+                        <div class="h-24 flex items-center justify-center">
+                            ${currentSubtitles ? `
+                                <div class="bg-black/90 border border-indigo-500/30 p-5 rounded-2xl text-white text-sm font-bold shadow-2xl flex items-center gap-4 max-w-xl text-center leading-relaxed animate-in fade-in slide-in-from-top-2">
+                                    <div class="flex-shrink-0 w-3 h-3 rounded-full bg-indigo-500 animate-pulse"></div>
+                                    <span>${currentSubtitles}</span>
                                 </div>
+                            ` : ''}
+                        </div>
+
+                        <div class="bg-slate-900/50 border border-slate-800 rounded-[50px] p-10 relative min-h-[420px] flex items-center justify-center shadow-inner">
+                            <div class="absolute inset-0 flex items-center justify-center opacity-5 pointer-events-none">
+                                <i data-lucide="circle" class="w-[300px] h-[300px] text-slate-400"></i>
+                            </div>
+                            
+                            <div class="grid grid-cols-3 gap-x-16 gap-y-20 relative z-10 w-full">
+                                ${players.map((p, idx) => `
+                                    <div class="flex flex-col items-center gap-3">
+                                        <div class="relative">
+                                            <div class="w-20 h-20 rounded-full flex items-center justify-center text-xl font-black transition-all duration-300 ${
+                                                !p.isAlive ? 'bg-slate-950 text-slate-700 border border-slate-900 opacity-40 grayscale' : 
+                                                idx === myId ? 'bg-red-600 text-white ring-4 ring-red-500/30 scale-110 shadow-xl' : 
+                                                'bg-slate-800 text-slate-300 border-2 border-slate-700'
+                                            } ${p.isSpeaking ? 'ring-4 ring-blue-500 shadow-blue-500/50 scale-110 z-20' : ''}">
+                                                ${p.name[0]}
+                                            </div>
+                                            ${idx === myId ? '<div class="absolute -top-2 -right-2 bg-red-500 text-[9px] font-black px-2 py-0.5 rounded-full text-white shadow-md">나</div>' : ''}
+                                            ${p.isSpeaking ? '<div class="absolute -bottom-2 -right-2 bg-blue-500 p-2 rounded-full animate-bounce shadow-md border-2 border-slate-900"><i data-lucide="mic" class="w-3 h-3 text-white"></i></div>' : ''}
+                                            ${p.vote !== null && phase === PHASES.VOTING ? `<div class="absolute -top-10 left-1/2 -translate-x-1/2 bg-amber-500 text-[10px] text-black font-black px-3 py-1 rounded-lg shadow-lg animate-in zoom-in">지목!</div>` : ''}
+                                        </div>
+                                        <div class="flex flex-col items-center">
+                                            <span class="text-sm font-black ${!p.isAlive ? 'text-slate-600 line-through' : 'text-slate-200'}">${p.name}</span>
+                                            ${p.role && (idx === myId || !p.isAlive || phase === PHASES.GAME_OVER) ? `<span class="text-[9px] text-red-500 font-bold tracking-widest mt-1">${p.role}</span>` : ''}
+                                        </div>
+                                    </div>
+                                `).join('')}
                             </div>
                         </div>
 
-                        <!-- Main Status Banner -->
-                        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 flex justify-between items-center">
-                            <div class="flex items-center gap-4">
-                                <div class="${roomData.phase === PHASES.NIGHT ? 'text-indigo-400' : 'text-amber-400'}">
-                                    <i data-lucide="${roomData.phase === PHASES.NIGHT ? 'moon' : 'sun'}" class="w-8 h-8"></i>
-                                </div>
-                                <div>
-                                    <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">현재 단계</span>
-                                    <h4 class="text-xl font-black">${roomData.phase}</h4>
-                                </div>
-                            </div>
-                            <div class="flex items-center gap-3">
-                                <div class="hidden md:flex flex-col items-end mr-4">
-                                    <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">방 코드</span>
-                                    <span class="font-mono text-emerald-400 font-bold">${roomId}</span>
-                                </div>
-                                ${roomData.phase === PHASES.LOBBY && myData?.isHost ? `
-                                    <button id="btn-start" class="px-6 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg font-bold">게임 시작</button>
-                                ` : ''}
-                            </div>
-                        </div>
-
-                        <!-- Action Panel -->
-                        <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden min-h-[300px]">
+                        <div class="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl">
                             <div class="p-4 bg-slate-800/50 border-b border-slate-700 flex justify-between items-center">
-                                <span class="text-xs font-bold text-slate-400">액션 패널</span>
-                                ${myData?.role ? `<span class="text-xs bg-indigo-500/20 text-indigo-400 px-2 py-1 rounded font-bold">${myData.role}</span>` : ''}
+                                <span class="text-[11px] font-bold text-slate-400 tracking-widest uppercase">작전 콘트롤 센터</span>
+                                <span class="text-[10px] font-black text-indigo-400 px-3 py-1 bg-indigo-400/10 rounded-full border border-indigo-400/20">${phase}</span>
                             </div>
-                            <div class="p-6" id="action-content">
+                            <div class="p-8">
                                 ${renderActionContent()}
                             </div>
                         </div>
                     </div>
 
-                    <!-- Right: Players & Logs -->
                     <div class="md:col-span-4 space-y-6">
-                        <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
-                            <div class="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-sm">참여자 명단 (${players.length})</div>
-                            <div class="p-2 space-y-1">
-                                ${players.map(p => `
-                                    <div class="flex items-center justify-between p-3 rounded-lg ${p.id === user.uid ? 'bg-slate-800 border border-slate-700' : ''}">
-                                        <div class="flex items-center gap-3">
-                                            <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ${!p.isAlive ? 'bg-red-900/20 text-red-500' : 'bg-slate-700 text-white'}">
-                                                ${p.name[0]}
-                                            </div>
-                                            <div class="flex flex-col">
-                                                <span class="text-sm font-semibold ${!p.isAlive ? 'text-slate-600 line-through' : ''}">${p.name} ${p.id === user.uid ? '(나)' : ''}</span>
-                                                ${!p.isAlive ? '<span class="text-[9px] text-red-700 font-bold uppercase">Dead</span>' : ''}
-                                            </div>
-                                        </div>
-                                        ${p.isHost ? '<i data-lucide="crown" class="w-4 h-4 text-amber-500"></i>' : ''}
+                        <div class="bg-slate-900 border border-slate-800 rounded-3xl p-5 h-[640px] flex flex-col shadow-2xl">
+                            <div class="flex items-center justify-between mb-4 border-b border-slate-800 pb-3">
+                                <span class="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><i data-lucide="activity" class="w-4 h-4"></i> 타임라인</span>
+                                <button onclick="setIsMuted(!isMuted)" class="p-2 rounded-xl hover:bg-slate-800 transition-all">
+                                    <i data-lucide="${isMuted ? 'volume-x' : 'volume-2'}" class="w-4 h-4 ${isMuted ? 'text-red-500' : 'text-emerald-500'}"></i>
+                                </button>
+                            </div>
+                            <div id="log-container" class="flex-1 overflow-y-auto space-y-4 pr-2 scrollbar-thin">
+                                ${logs.map(log => `
+                                    <div class="p-4 rounded-2xl border border-slate-800 bg-slate-950/60 animate-in slide-in-from-right-2 duration-300">
+                                        <p class="text-[12px] leading-relaxed text-slate-300 font-medium">${log}</p>
                                     </div>
                                 `).join('')}
                             </div>
                         </div>
-                        <button id="btn-exit" class="w-full flex items-center justify-center gap-2 p-3 text-xs text-slate-500 hover:text-red-400 transition-colors">
-                            <i data-lucide="log-out" class="w-4 h-4"></i> 방 나가기
-                        </button>
                     </div>
                 </div>
             `;
-
-            if (document.getElementById('btn-start')) document.getElementById('btn-start').onclick = startGame;
-            if (document.getElementById('btn-exit')) document.getElementById('btn-exit').onclick = exitRoom;
-            bindActionEvents();
+            const logContainer = document.getElementById('log-container');
+            if(logContainer) logContainer.scrollTop = logContainer.scrollHeight;
         };
 
-        const getPhaseInstructions = () => {
-            switch(roomData.phase) {
-                case PHASES.LOBBY: return { title: "대기실", desc: "플레이어들이 모두 입장할 때까지 기다려 주세요. 최소 4명이 모여야 게임을 시작할 수 있습니다. 닉네임과 방 코드를 친구들에게 공유하세요." };
-                case PHASES.NIGHT: return { title: "어둠이 내려앉은 밤", desc: "마피아는 희생자를 고르고, 경찰은 정체를 파악하며, 의사는 생명을 구합니다. 자신의 역할에 맞는 행동을 수행하세요." };
-                case PHASES.DISCUSSION: return { title: "낮의 토론 시간", desc: "밤 사이 일어난 사건을 확인하고, 누가 마피아인지 의심되는 사람을 자유롭게 추론하세요." };
-                case PHASES.VOTING: return { title: "최종 투표", desc: "가장 의심스러운 한 명을 지목하세요. 과반수 득표 시 재판대에 오르게 됩니다." };
-                case PHASES.TRIAL: return { title: "재판과 최후변론", desc: "지목된 자의 변론을 들으세요. 방장은 최종 유죄 여부를 판결할 책임이 있습니다." };
-                case PHASES.GAME_OVER: return { title: "게임 결과", desc: "모든 승패가 결정되었습니다. 수고하셨습니다!" };
-                default: return { title: "안내", desc: "사회자의 지시에 따라 게임을 진행하세요." };
-            }
-        };
+        const setIsMuted = (val) => { isMuted = val; updateUI(); };
 
         const renderActionContent = () => {
-            if (!myData?.isAlive) return `<div class="text-center py-10 opacity-40"><i data-lucide="skull" class="w-12 h-12 mx-auto mb-4"></i><p>사망 상태입니다. 살아남은 자들의 사투를 지켜보세요.</p></div>`;
+            const me = players[myId];
+            if (!me.isAlive) return `<div class="text-center py-6 opacity-40 text-slate-500 italic">당신은 사망했습니다... 유령 모드로 지켜보세요.</div>`;
 
-            if (roomData.phase === PHASES.NIGHT) {
-                if (myData.role === ROLES.CITIZEN) return `<p class="text-center py-10 italic text-indigo-400">당신은 시민입니다. 조용히 아침이 밝기를 기다리십시오...</p>`;
+            if (phase === PHASES.NIGHT) {
+                if (me.role === ROLES.CITIZEN) return `<div class="text-center py-6 italic text-indigo-400 animate-pulse text-sm font-bold">밤이 되었습니다. 마피아가 활동 중입니다...</div>`;
                 return `
-                    <p class="text-sm text-slate-400 mb-4">${myData.role} 전용 행동: 대상을 선택하세요.</p>
-                    <div class="grid grid-cols-2 gap-3">
-                        ${players.filter(p => p.isAlive && p.id !== user.uid).map(p => `
-                            <button class="action-target py-3 rounded-lg border border-slate-700 bg-slate-800 hover:border-indigo-500 transition-all ${myData.target === p.id ? 'border-indigo-500 bg-indigo-500/10' : ''}" data-id="${p.id}">
+                    <p class="text-[11px] text-slate-500 mb-5 uppercase font-bold tracking-widest text-center">${me.role} 활동 대상 지목</p>
+                    <div class="grid grid-cols-2 gap-4">
+                        ${players.map((p, idx) => (p.isAlive && idx !== myId) ? `
+                            <button onclick="handleAction(${idx})" class="py-4 rounded-2xl border border-slate-700 bg-slate-800 hover:border-indigo-500 hover:bg-indigo-500/10 transition-all text-xs font-black text-white">
                                 ${p.name}
                             </button>
-                        `).join('')}
+                        ` : '').join('')}
                     </div>
                 `;
             }
 
-            if (roomData.phase === PHASES.DISCUSSION || roomData.phase === PHASES.VOTING) {
+            if (phase === PHASES.DISCUSSION) {
                 return `
-                    <p class="text-sm text-slate-400 mb-4">누가 마피아입니까? 의심스러운 사람에게 투표하세요.</p>
-                    <div class="grid grid-cols-2 gap-3">
-                        ${players.filter(p => p.isAlive).map(p => `
-                            <button class="vote-target py-3 rounded-lg border border-slate-700 bg-slate-800 hover:border-amber-500 transition-all ${myData.vote === p.id ? 'border-amber-500 bg-amber-500/10' : ''}" data-id="${p.id}">
-                                ${p.name} ${p.id === user.uid ? '(나)' : ''}
+                    <div class="space-y-6">
+                        <div class="flex gap-3">
+                            <input type="text" id="chat-input" 
+                                value="${chatInputBuffer}"
+                                oninput="chatInputBuffer = this.value"
+                                placeholder="의심스러운 사람의 이름을 부르며 대화하세요..." 
+                                class="flex-1 bg-slate-950 border border-slate-800 p-5 rounded-2xl text-sm outline-none focus:ring-2 focus:ring-indigo-500/50 transition-all font-bold text-white shadow-inner"
+                                onkeypress="if(event.keyCode==13) sendMessage()">
+                            <button onclick="sendMessage()" class="w-16 bg-red-600 hover:bg-red-500 rounded-2xl transition-all shadow-xl flex items-center justify-center text-white">
+                                <i data-lucide="send" class="w-6 h-6"></i>
                             </button>
-                        `).join('')}
-                    </div>
-                `;
-            }
-
-            if (roomData.phase === PHASES.TRIAL) {
-                const nominee = players.find(p => p.id === roomData.nomineeId);
-                return `
-                    <div class="text-center py-6">
-                        <div class="w-16 h-16 bg-red-500/20 rounded-full flex items-center justify-center mx-auto mb-4 border border-red-500/50">
-                            <i data-lucide="mic" class="text-red-500 animate-pulse"></i>
                         </div>
-                        <h5 class="text-lg font-bold mb-2">${nominee?.name} 님의 최후 변론</h5>
-                        <p class="text-sm text-slate-400 mb-6">마이크 권한이 활성화되었습니다.</p>
-                        ${myData.isHost ? `
-                            <div class="flex gap-4">
-                                <button id="btn-guilty" class="flex-1 py-3 bg-red-600 rounded-xl font-bold shadow-lg shadow-red-900/20">유죄 (처형)</button>
-                                <button id="btn-innocent" class="flex-1 bg-slate-700 rounded-xl font-bold">무죄 (방면)</button>
-                            </div>
-                        ` : ''}
+                        <div class="flex justify-center border-t border-slate-800 pt-6">
+                            <button onclick="goToVoting()" class="w-full py-5 bg-amber-600 hover:bg-amber-500 rounded-2xl font-black text-sm uppercase tracking-widest shadow-lg shadow-amber-900/30 transition-all text-white">
+                                토론 종료 및 투표 시작
+                            </button>
+                        </div>
                     </div>
                 `;
             }
 
-            if (roomData.phase === PHASES.GAME_OVER) {
-                return `<div class="text-center py-10"><h2 class="text-2xl font-black text-emerald-400 mb-2">게임 종료</h2><p class="text-slate-400">${roomData.lastPhaseMsg}</p></div>`;
+            if (phase === PHASES.VOTING) {
+                return `
+                    <p class="text-[11px] text-slate-500 mb-5 uppercase font-bold text-center tracking-widest">처형대에 세울 용의자를 선택하세요.</p>
+                    <div class="grid grid-cols-2 gap-4">
+                        ${players.map((p, idx) => p.isAlive ? `
+                            <button onclick="handleVote(${idx})" class="py-4 rounded-2xl border border-slate-700 bg-slate-800 hover:border-amber-500 transition-all text-xs font-black text-white ${me.vote === idx ? 'ring-2 ring-amber-500 bg-amber-500/10' : ''}">
+                                ${p.name}
+                            </button>
+                        ` : '').join('')}
+                    </div>
+                `;
             }
 
-            return `<div class="text-center py-10 text-slate-600 italic">다른 플레이어들의 결정을 기다리는 중입니다...</div>`;
-        };
-
-        const bindActionEvents = () => {
-            document.querySelectorAll('.action-target').forEach(btn => {
-                btn.onclick = async () => {
-                    const tid = btn.dataset.id;
-                    const pRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId, 'players', user.uid);
-                    await updateDoc(pRef, { target: tid });
-                    
-                    const actives = players.filter(p => p.isAlive && p.role !== ROLES.CITIZEN);
-                    const updatedCount = players.filter(p => p.isAlive && p.role !== ROLES.CITIZEN && (p.id === user.uid ? tid : p.target)).length;
-                    if (updatedCount >= actives.length && myData.isHost) {
-                        processNight();
-                    }
-                };
-            });
-
-            document.querySelectorAll('.vote-target').forEach(btn => {
-                btn.onclick = async () => {
-                    const vid = btn.dataset.id;
-                    const pRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId, 'players', user.uid);
-                    await updateDoc(pRef, { vote: vid });
-                };
-            });
-
-            if (document.getElementById('btn-guilty')) {
-                document.getElementById('btn-guilty').onclick = () => handleExecution(true);
-                document.getElementById('btn-innocent').onclick = () => handleExecution(false);
+            if (phase === PHASES.TRIAL) {
+                return `
+                    <div class="flex gap-4">
+                        <button onclick="handleJudgement(true)" class="flex-1 py-5 bg-red-600 hover:bg-red-500 rounded-2xl font-black shadow-xl text-lg text-white">유죄 (처형)</button>
+                        <button onclick="handleJudgement(false)" class="flex-1 py-5 bg-slate-700 hover:bg-slate-600 rounded-2xl font-black text-lg text-white">무죄 (방면)</button>
+                    </div>
+                `;
             }
+
+            return `<div class="text-center py-6 text-slate-600 italic text-sm animate-pulse tracking-tighter">사회자가 상황을 정리하고 있습니다...</div>`;
         };
 
-        // --- Logic Handlers ---
-        const createRoom = async () => {
-            if (!user) return;
-            const nickname = document.getElementById('create-nickname').value.trim();
-            let customId = document.getElementById('create-code').value.trim().toUpperCase();
+        // --- 게임 로직 ---
+        const startGame = () => {
+            const nickname = document.getElementById('player-nickname').value.trim() || "플레이어";
+            players = [{ name: nickname, role: null, isAlive: true, vote: null, target: null, isSpeaking: false }];
             
-            if (!nickname) { alert("닉네임을 입력해주세요."); return; }
-            if (!customId) customId = Math.random().toString(36).substring(2, 8).toUpperCase();
-
-            const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', customId);
-            const checkSnap = await getDoc(roomRef);
-            if (checkSnap.exists()) { alert("이미 사용 중인 방 코드입니다. 다른 코드를 사용해주세요."); return; }
-
-            await setDoc(roomRef, {
-                id: customId, host: user.uid, status: PHASES.LOBBY, phase: PHASES.LOBBY, createdAt: Date.now(),
-                lastPhaseMsg: "새로운 게임방이 생성되었습니다. 모두 환영합니다!"
+            const selectedAI = [...AI_NAMES].sort(() => Math.random() - 0.5).slice(0, 5);
+            selectedAI.forEach(name => {
+                players.push({ name: name, role: null, isAlive: true, vote: null, target: null, isSpeaking: false });
             });
-            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', customId, 'players', user.uid), {
-                name: nickname, isHost: true, isAlive: true, role: null, vote: null, target: null
-            });
-            startListening(customId);
-        };
 
-        const joinRoom = async () => {
-            if (!user) return;
-            const nickname = document.getElementById('join-nickname').value.trim();
-            const id = document.getElementById('join-code').value.trim().toUpperCase();
+            const roles = [ROLES.MAFIA, ROLES.POLICE, ROLES.DOCTOR, ROLES.CITIZEN, ROLES.CITIZEN, ROLES.CITIZEN];
+            const shuffledRoles = roles.sort(() => Math.random() - 0.5);
+            players.forEach((p, i) => p.role = shuffledRoles[i]);
+
+            phase = PHASES.NIGHT;
+            speakText(`마피아 게임이 시작되었습니다. 당신의 정체는 ${players[myId].role}입니다. 이제 밤이 되었습니다. 모두 눈을 감으세요.`);
             
-            if (!nickname) { alert("닉네임을 입력해주세요."); return; }
-            if (!id) { alert("방 코드를 입력해주세요."); return; }
-
-            const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', id);
-            const snap = await getDoc(roomRef);
-            if (!snap.exists()) { alert("방을 찾을 수 없습니다. 코드를 확인해주세요."); return; }
-
-            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', id, 'players', user.uid), {
-                name: nickname, isHost: false, isAlive: true, role: null, vote: null, target: null
-            });
-            startListening(id);
-        };
-
-        const startListening = (id) => {
-            if (unsubRoom) unsubRoom();
-            if (unsubPlayers) unsubPlayers();
-
-            roomId = id;
-            const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', id);
-            unsubRoom = onSnapshot(roomRef, (snapshot) => {
-                if (snapshot.exists()) {
-                    roomData = snapshot.data();
-                    if (roomData.lastPhaseMsg && lastPhaseRef.current !== roomData.lastPhaseMsg) {
-                        lastPhaseRef.current = roomData.lastPhaseMsg;
-                        speakText(roomData.lastPhaseMsg);
-                    }
-                    updateUI();
-                } else {
-                    exitRoom();
-                }
-            }, (err) => console.error("Room Listener Error:", err));
-
-            const playersCol = collection(db, 'artifacts', appId, 'public', 'data', 'rooms', id, 'players');
-            unsubPlayers = onSnapshot(playersCol, (snapshot) => {
-                players = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-                myData = players.find(p => p.id === user.uid);
-                updateUI();
-            }, (err) => console.error("Players Listener Error:", err));
-        };
-
-        const startGame = async () => {
-            if (players.length < 4) { alert("최소 4명이 필요합니다."); return; }
-            const shuffled = [...players].sort(() => Math.random() - 0.5);
-            const roles = [ROLES.MAFIA, ROLES.POLICE, ROLES.DOCTOR];
-            for (let i = 3; i < players.length; i++) roles.push(ROLES.CITIZEN);
-            
-            for (let i = 0; i < shuffled.length; i++) {
-                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId, 'players', shuffled[i].id), {
-                    role: roles[i], isAlive: true, target: null, vote: null
-                });
+            if (players[myId].role === ROLES.CITIZEN) {
+                setTimeout(() => {
+                    speakText("밤이 길어지고 있습니다. 마피아가 은밀하게 활동 중입니다.");
+                    setTimeout(processAIInNight, 7000);
+                }, 4000);
             }
-            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId), {
-                phase: PHASES.NIGHT, lastPhaseMsg: "게임이 시작되었습니다. 밤이 되었습니다. 모두 눈을 감아주세요."
-            });
+            updateUI();
         };
 
-        const processNight = async () => {
-            const mafiaAction = players.find(p => p.role === ROLES.MAFIA && p.isAlive)?.target;
-            const doctorAction = players.find(p => p.role === ROLES.DOCTOR && p.isAlive)?.target;
-            let deadId = null;
-            let msg = "☀️ 아침이 밝았습니다. ";
+        const sendMessage = () => {
+            const input = document.getElementById('chat-input');
+            const msg = input.value.trim();
+            if (!msg || phase !== PHASES.DISCUSSION) return;
 
-            if (mafiaAction && mafiaAction !== doctorAction) {
-                deadId = mafiaAction;
-                const victim = players.find(p => p.id === deadId);
-                msg += `지난밤, ${victim.name} 님이 마피아의 습격을 받아 사망했습니다.`;
-                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId, 'players', deadId), { isAlive: false });
-            } else if (mafiaAction && mafiaAction === doctorAction) {
-                msg += "기적적으로 의사가 희생자를 살려냈습니다!";
+            const me = players[myId];
+            speakText(msg, true, me.name, myId);
+            
+            chatInputBuffer = ""; 
+            input.value = "";
+
+            setTimeout(() => {
+                const mentionedAI = players.find(p => p.isAlive && players.indexOf(p) !== myId && msg.includes(p.name));
+                
+                if (mentionedAI) triggerContextualResponse("ACCUSATION", mentionedAI);
+                else triggerContextualResponse("GENERAL");
+            }, 3000);
+        };
+
+        const triggerContextualResponse = (type, target = null) => {
+            const aliveAIs = players.filter((p, i) => p.isAlive && i !== myId);
+            if (aliveAIs.length === 0) return;
+            
+            let speaker, text;
+            
+            if (type === "ACCUSATION") {
+                speaker = target;
+                const defenses = [
+                    `아니, ${players[myId].name}님! 제가 왜요? 전 결백합니다!`,
+                    `흠, 저를 의심하시는 건가요? 제가 마피아라면 이렇게 당당하겠습니까?`,
+                    `증거도 없이 사람을 몰아가면 안 됩니다. 저는 정말 시민이라구요.`
+                ];
+                text = defenses[Math.floor(Math.random() * defenses.length)];
             } else {
-                msg += "아무런 사건도 일어나지 않은 평화로운 밤이었습니다.";
+                speaker = aliveAIs[Math.floor(Math.random() * aliveAIs.length)];
+                const others = aliveAIs.filter(p => p !== speaker);
+                const suspect = others[0] || players[myId];
+                const generalTexts = [
+                    `${players[myId].name}님 말대로 지금 마을 분위기가 흉흉하네요.`,
+                    `저는 아까부터 조용히 눈치만 보는 ${suspect.name}님이 유독 마피아 같아 보입니다.`,
+                    `우리 더 솔직하게 대화해 봅시다. 범인은 분명 실수할 겁니다.`
+                ];
+                text = generalTexts[Math.floor(Math.random() * generalTexts.length)];
             }
 
-            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId), {
-                phase: PHASES.DISCUSSION, lastPhaseMsg: msg
-            });
-            checkWin();
+            speakText(text, true, speaker.name, players.indexOf(speaker));
         };
 
-        const handleExecution = async (guilty) => {
-            const nominee = players.find(p => p.id === roomData.nomineeId);
-            let msg = guilty ? `${nominee.name} 님이 처형되었습니다.` : `${nominee.name} 님이 혐의를 벗고 방면되었습니다.`;
-            if (guilty) await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId, 'players', nominee.id), { isAlive: false });
+        const handleAction = (targetIdx) => {
+            players[myId].target = targetIdx;
+            speakText(`${players[targetIdx].name}님을 지목했습니다. 결과를 기다리십시오.`);
+            processAIInNight();
+        };
+
+        const processAIInNight = () => {
+            players.forEach((p, i) => {
+                if (i !== myId && p.isAlive) {
+                    const alives = players.filter(pl => pl.isAlive);
+                    if (p.role === ROLES.MAFIA) {
+                        const targets = players.filter((pl) => pl.isAlive && pl.role !== ROLES.MAFIA);
+                        p.target = players.indexOf(targets[Math.floor(Math.random() * targets.length)]);
+                    } else if (p.role === ROLES.DOCTOR) {
+                        p.target = players.indexOf(alives[Math.floor(Math.random() * alives.length)]);
+                    } else if (p.role === ROLES.POLICE) {
+                        const others = players.filter((pl, idx) => pl.isAlive && idx !== i);
+                        p.target = players.indexOf(others[Math.floor(Math.random() * others.length)]);
+                    }
+                }
+            });
+            setTimeout(processMorning, 3000);
+        };
+
+        const processMorning = () => {
+            phase = PHASES.MORNING;
+            updateUI();
+
+            const mafiaTargetIdx = players.find(p => p.role === ROLES.MAFIA && p.isAlive)?.target;
+            const doctorTargetIdx = players.find(p => p.role === ROLES.DOCTOR && p.isAlive)?.target;
             
-            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId), {
-                phase: PHASES.NIGHT, lastPhaseMsg: msg + " 다시 밤이 찾아옵니다."
-            });
-            checkWin();
+            speakText("긴 밤이 지나고 아침이 밝았습니다. 생존자들은 눈을 뜨세요.");
+            
+            setTimeout(() => {
+                let resultMsg = "";
+                let callback = null;
+
+                if (mafiaTargetIdx !== undefined && mafiaTargetIdx !== doctorTargetIdx) {
+                    const victim = players[mafiaTargetIdx];
+                    resultMsg = `충격적인 소식입니다. 지난밤 마피아의 공격으로 ${victim.name}님이 싸늘한 시신으로 발견되었습니다.`;
+                    callback = () => { victim.isAlive = false; updateUI(); };
+                } else if (mafiaTargetIdx !== undefined && mafiaTargetIdx === doctorTargetIdx) {
+                    resultMsg = "기적 같은 아침입니다! 마피아가 활동했으나 다행히 유능한 의사가 희생자를 지켜냈습니다!";
+                } else {
+                    resultMsg = "지난밤 아무런 소동도 없었습니다. 다행히 모두가 무사한 평화로운 밤이었습니다.";
+                }
+
+                speakText(resultMsg, false, "", undefined, callback);
+
+                setTimeout(() => {
+                    if (checkGameOver()) return;
+                    phase = PHASES.DISCUSSION;
+                    speakText("이제 진범을 가리기 위한 자유 토론 시간입니다. 의심스러운 자를 지목하십시오.");
+                    updateUI();
+                }, 8000);
+            }, 6000);
         };
 
-        const checkWin = () => {
+        const goToVoting = () => {
+            phase = PHASES.VOTING;
+            speakText("토론을 마치고 최후의 투표를 시작합니다. 마피아라고 확신하는 한 명을 지목하세요.");
+            updateUI();
+        };
+
+        const handleVote = (targetIdx) => {
+            if (players[myId].vote !== null) return;
+            players[myId].vote = targetIdx;
+            
+            players.forEach((p, i) => {
+                if (i !== myId && p.isAlive) {
+                    const pool = players.filter(pl => pl.isAlive && players.indexOf(pl) !== i); 
+                    p.vote = players.indexOf(pool[Math.floor(Math.random() * pool.length)]);
+                }
+            });
+            updateUI();
+
+            setTimeout(() => {
+                const counts = {};
+                players.forEach(p => { if (p.isAlive && p.vote !== null) counts[p.vote] = (counts[p.vote] || 0) + 1; });
+                
+                let max = 0, top = null;
+                Object.keys(counts).forEach(id => { if (counts[id] > max) { max = counts[id]; top = parseInt(id); } });
+
+                nomineeId = top;
+                phase = PHASES.TRIAL;
+                speakText(`투표 결과, ${players[nomineeId].name}님이 마피아 용의자로 최종 지목되었습니다. 재판을 시작하겠습니다.`);
+                updateUI();
+            }, 3000);
+        };
+
+        const handleJudgement = (isGuilty) => {
+            const nominee = players[nomineeId];
+            let msg = isGuilty ? `${nominee.name}님이 마을 사람들의 결정으로 처형되었습니다. 정체는 [${nominee.role}]이었습니다.` : `${nominee.name}님이 혐의를 벗고 방면되었습니다. 다시 밤이 찾아오고 있습니다.`;
+            
+            const callback = isGuilty ? () => { nominee.isAlive = false; updateUI(); } : null;
+            
+            speakText(msg, false, "", undefined, callback);
+
+            setTimeout(() => {
+                if (checkGameOver()) return;
+                players.forEach(p => { p.vote = null; p.target = null; });
+                phase = PHASES.NIGHT;
+                if (players[myId].role === ROLES.CITIZEN || !players[myId].isAlive) setTimeout(processAIInNight, 6000);
+                updateUI();
+            }, 8000);
+        };
+
+        const checkGameOver = () => {
             const mafias = players.filter(p => p.isAlive && p.role === ROLES.MAFIA).length;
             const citizens = players.filter(p => p.isAlive && p.role !== ROLES.MAFIA).length;
-            if (mafias === 0) endGame("축하합니다! 모든 마피아를 검거하여 시민이 승리했습니다.");
-            else if (mafias >= citizens) endGame("마피아가 마을을 완전히 장악했습니다. 마피아의 완승입니다.");
-        };
-
-        const endGame = async (msg) => {
-            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId), {
-                phase: PHASES.GAME_OVER, status: PHASES.GAME_OVER, lastPhaseMsg: msg
-            });
-        };
-
-        const exitRoom = () => { 
-            if (unsubRoom) unsubRoom();
-            if (unsubPlayers) unsubPlayers();
-            roomId = ''; roomData = null; updateUI(); 
-        };
-
-        // --- Init ---
-        const initAuth = async () => {
-            if (!app) {
-                updateUI();
-                return;
+            if (mafias === 0) {
+                phase = PHASES.GAME_OVER;
+                speakText("축하합니다! 위대한 시민들의 승리입니다. 모든 마피아가 검거되었습니다.");
+                updateUI(); return true;
+            } else if (mafias >= citizens) {
+                phase = PHASES.GAME_OVER;
+                speakText("비극이네요. 마을이 마피아들의 손에 완전히 장악되었습니다.");
+                updateUI(); return true;
             }
-            try {
-                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                    await signInWithCustomToken(auth, __initial_auth_token);
-                } else { 
-                    await signInAnonymously(auth); 
-                }
-            } catch (err) { console.error("Auth Error:", err); }
+            return false;
         };
 
-        window.onload = () => {
-            initAuth();
-            if (auth) {
-                onAuthStateChanged(auth, (u) => { 
-                    user = u; 
-                    updateUI(); 
-                });
-            } else {
-                updateUI();
-            }
-        };
-
+        window.onload = () => { updateUI(); };
     </script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;700;900&display=swap');
         body { font-family: 'Pretendard', sans-serif; background-color: #020617; color: #f8fafc; overflow-x: hidden; }
-        .animate-in { animation: fadeIn 0.5s ease-out; }
+        .animate-in { animation: fadeIn 0.4s ease-out; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .scrollbar-thin::-webkit-scrollbar { width: 4px; }
+        .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+        .scrollbar-thin::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 10px; }
     </style>
 </head>
 <body class="p-4 md:p-8">
 
-    <div class="max-w-4xl mx-auto">
-        <!-- Developer Header -->
-        <div class="mb-10 text-center space-y-2">
-            <div class="inline-block px-4 py-1 bg-gradient-to-r from-red-600 to-amber-600 rounded-full text-[10px] font-black tracking-[0.2em] mb-2 shadow-lg shadow-red-900/20">
-                OFFICIAL SYSTEM
+    <div class="max-w-5xl mx-auto">
+        <!-- 개발자 및 헤더 -->
+        <div class="mb-6 text-center space-y-3">
+            <div class="inline-block px-5 py-1.5 bg-red-600 rounded-full text-[10px] font-black tracking-[0.2em] shadow-lg shadow-red-900/30">
+                개발자: 가치있는 미래교육 연구소 대표 김병찬
             </div>
-            <h1 class="text-3xl md:text-4xl font-black tracking-tighter bg-clip-text text-transparent bg-gradient-to-b from-white to-slate-500">
+            <h1 class="text-3xl md:text-5xl font-black tracking-tighter bg-clip-text text-transparent bg-gradient-to-b from-white to-slate-500 italic">
                 VOICE MAFIA
             </h1>
-            <div class="bg-indigo-600/10 border border-indigo-500/20 py-2 px-4 rounded-lg inline-block mt-4">
-                <p class="text-indigo-400 font-bold text-sm">개발자: 가치있는 미래교육 연구소 대표 김병찬</p>
-            </div>
         </div>
 
-        <!-- Main Game Root -->
         <div id="game-root">
-            <div class="flex flex-col items-center justify-center h-64 space-y-4">
-                <div class="w-10 h-10 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
-                <div class="text-slate-400 font-medium">서버 접속 중...</div>
-            </div>
+            <!-- JS에서 렌더링 -->
         </div>
 
-        <!-- Instructions Footer -->
-        <div class="mt-12 grid grid-cols-1 md:grid-cols-3 gap-4 border-t border-slate-900 pt-8 opacity-50 text-[10px] uppercase tracking-widest text-slate-500">
-            <div class="flex items-center gap-2">
-                <div class="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
-                Custom Room Code
-            </div>
-            <div class="flex items-center gap-2">
-                <div class="w-1.5 h-1.5 rounded-full bg-blue-500"></div>
-                Set Nickname
-            </div>
-            <div class="flex items-center gap-2">
-                <div class="w-1.5 h-1.5 rounded-full bg-indigo-500"></div>
-                Voice Guidance
-            </div>
+        <div class="mt-12 grid grid-cols-1 md:grid-cols-3 gap-4 border-t border-slate-900 pt-8 opacity-40 text-[9px] uppercase tracking-widest text-slate-500">
+            <div class="flex items-center gap-2"><div class="w-1.5 h-1.5 rounded-full bg-indigo-500"></div>Context Engine</div>
+            <div class="flex items-center gap-2"><div class="w-1.5 h-1.5 rounded-full bg-blue-500"></div>Audio-UI Sync</div>
+            <div class="flex items-center gap-2"><div class="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>Safe JSON Parsing</div>
         </div>
         
-        <p class="mt-8 text-center text-slate-700 text-[10px] font-medium uppercase tracking-[0.3em]">
+        <p class="mt-8 text-center text-slate-800 text-[10px] font-medium uppercase tracking-[0.3em]">
             &copy; 2024 Valuable Future Education Research Institute
         </p>
     </div>
